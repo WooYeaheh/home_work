@@ -26,7 +26,8 @@ import matplotlib.pyplot as plt
 
 from loss import *
 from torch.utils.tensorboard import SummaryWriter
-
+from torch.optim import lr_scheduler
+from sklearn.manifold import TSNE
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 class train():
@@ -266,7 +267,7 @@ class train():
 
 class train_new():
     def __init__(self, config, trainDataset, valDataset, testDataset):
-        self.writer = SummaryWriter('runs/tsne_example')
+        self.writer = SummaryWriter(f'runs/{config.model_name}')
 
         self.config = config
         self.lmd1 = config.lmd1
@@ -328,21 +329,7 @@ class train_new():
         self.last_optimizer = optim.SGD(net.parameters(), lr=config.last_lr, momentum=config.momentum,
                                         weight_decay=config.weight_decay)
 
-        if self.vis['cls_tsne']:
-            self.figwrapper1 = FigureWrapper()
-            self.figwrapper2 = FigureWrapper()
-            self.figwrapper3 = FigureWrapper()
-            self.figwrapper4 = FigureWrapper()
-
-            self.fig1, self.axes1 = self.figwrapper1()
-            self.fig2, self.axes2 = self.figwrapper2()
-            self.fig3, self.axes3 = self.figwrapper3()
-            self.fig4, self.axes4 = self.figwrapper4()
-
-            from sklearn.manifold import TSNE
-            self.tsne = TSNE(n_components=2, perplexity=30, init='pca', random_state=42)
-
-        # self.train()
+        self.train()
         # self.train_two()
         self.test('46')
 
@@ -352,6 +339,7 @@ class train_new():
         optimizer = self.init_optimizer
         best_epoch = 0
         min_loss = float('inf')
+        os.makedirs(f'./weight/{self.config.model_name}/',exist_ok=True)
         train_log_path = f'./weight/{self.config.model_name}/train_log.txt'
         for i_epoch in range(self.epochs):
 
@@ -383,7 +371,9 @@ class train_new():
                 optimizer.zero_grad()
                 outputs = self.net(inputs1, inputs2)
                 # outputs = self.net(inputs1, inputs2, inputs3)
-                out_all, feat1, feat2 = outputs['out_all'], outputs['feat_1'], outputs['feat_2']
+                # out_all, feat1, feat2 = outputs['out_all'], outputs['feat_1'], outputs['feat_2']
+                feat1, feat2 = outputs['feat_1'], outputs['feat_2']
+
                 # out_all, feat1, feat2, feat3 = outputs['out_all'], outputs['feat_1'], outputs['feat_2'], outputs['feat_3']
                 loss_c1 = self.criterion(feat1, targets)
                 loss_c2 = self.criterion(feat2, targets)
@@ -429,6 +419,7 @@ class train_new():
 
             print('{} epoch >> Training Loss: {} | Validation Loss: {}'.format(i_epoch, train_loss / (batch_idx + 1),
                                                                                val_loss / (val_idx + 1)))
+            self.writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, i_epoch)
             with open(train_log_path, 'a') as f:
                 f.write('{} epoch >> Training Loss: {} | Validation Loss: {}\n\n'.format(i_epoch,
                                                                                          train_loss / (batch_idx + 1),
@@ -438,6 +429,7 @@ class train_new():
                 min_loss = val_loss / (val_idx + 1)
                 self.save(f'./weight/{self.config.model_name}/')
 
+        self.writer.close()
         print('Best epoch: {}'.format(best_epoch))
         with open(train_log_path, 'a') as f:
             f.write('Best epoch: {}'.format(best_epoch))
@@ -608,11 +600,8 @@ class train_new():
 
     def test(self, best_epoch):
         state = torch.load(f'./weight/{self.config.model_name}/best.pth', weights_only=True)
-        # # state = torch.load(f'D:/antispoof/result/{self.config.weight_name}/model_ckpt_{best_epoch}.pth',weights_only=True)
-        # # state = torch.load('D:/antispoof/result/weight/model_ckpt_49.pth')
         self.net.load_state_dict(state['net'], strict=True)
         self.net.eval()
-        # test_log_path = f'D:/antispoof/result/{self.config.weight_name}/test_log.txt'
         test_log_path = f'./weight/{self.config.model_name}/test_log.txt'
 
         test_loss = 0
@@ -620,7 +609,6 @@ class train_new():
         total = 0
         y_true, y_pred = [], []
         with torch.no_grad():
-            # batch iterations...
             for batch_idx, (rgb, ir, depth, labels) in enumerate(self.testloader):
                 inputs1, inputs2, inputs3, targets = rgb.to(self.device), ir.to(self.device), depth.to(
                     self.device), labels.to(self.device)
@@ -630,23 +618,12 @@ class train_new():
                 # feat1, feat2, out_all = outputs['feat_1'], outputs['feat_2'], outputs['out_all']
                 out_all = outputs['feat_2']
                 # out_all, feat1, feat2, feat3 = outputs['out_all'], outputs['feat_1'], outputs['feat_2'], outputs['feat_3']
-                if self.vis['patch_mean']:
-                    self.visualize(outputs['attn_feats']['rgb'], name='attn_rgb', img_num=batch_idx + 1, img=inputs1)
-                    self.visualize(outputs['attn_feats']['ir'], name='attn_ir', img_num=batch_idx + 1, img=inputs2)
-                    self.visualize(outputs['mlp_feats']['rgb'], name='mlp_rgb', img_num=batch_idx + 1, img=inputs1)
-                    self.visualize(outputs['mlp_feats']['ir'], name='mlp_ir', img_num=batch_idx + 1, img=inputs2)
-                if self.vis['cls_tsne']:
-                    self.visualize_tsne(fig=self.fig1, axes=self.axes1, feats=outputs['attn_feats']['rgb'],
-                                        name='attn_rgb', img_num=batch_idx + 1, labels=labels)
-                    self.visualize_tsne(fig=self.fig2, axes=self.axes2, feats=outputs['attn_feats']['ir'],
-                                        name='attn_ir', img_num=batch_idx + 1, labels=labels)
-                    self.visualize_tsne(fig=self.fig3, axes=self.axes3, feats=outputs['mlp_feats']['rgb'],
-                                        name='mlp_rgb', img_num=batch_idx + 1, labels=labels)
-                    self.visualize_tsne(fig=self.fig4, axes=self.axes4, feats=outputs['mlp_feats']['ir'], name='mlp_ir',
-                                        img_num=batch_idx + 1, labels=labels)
                 # c1, c2, m1, m2, c3 = outputs['1c'], outputs['2c'], outputs['1m'], outputs['2m'], outputs['3c']
                 # out_all = out_all
                 # self.analyze(out_all, feat1, feat2, targets)
+                if batch_idx == 0 and outputs.get('rgb_feats',None):
+                    self.visualize_feat2TSNE(outputs['rgb_feats'],labels,'rgb.jpg')
+                    self.visualize_feat2TSNE(outputs['ir_feats'],labels,'ir.jpg')
 
                 loss = self.criterion(out_all, targets)
 
@@ -661,14 +638,10 @@ class train_new():
                 y_true.extend(targets.flatten().tolist())
                 # print(prediction)
                 # correct += prediction.eq(labels.data.view_as(prediction)).cpu().sum()
-            if self.vis['cls_tsne']:
-                self.figwrapper1.save(path=f'D:/antispoof/TSNE/{self.config.weight_name}/attn_feats_rgb.png')
-                self.figwrapper2.save(path=f'D:/antispoof/TSNE/{self.config.weight_name}/attn_feats_ir.png')
-                self.figwrapper3.save(path=f'D:/antispoof/TSNE/{self.config.weight_name}/mlp_feats_rgb.png')
-                self.figwrapper4.save(path=f'D:/antispoof/TSNE/{self.config.weight_name}/mlp_feats_ir.png')
-            self.writer.add_embedding(outputs['attn_feats']['rgb'][-1][:,0], metadata = labels.tolist(), label_img=F.interpolate(inputs2,size=(32,32)), global_step=batch_idx)
-            self.writer.add_images()
-            self.writer.close()
+
+            # self.writer.add_embedding(outputs['attn_feats']['rgb'][-1][:,0], metadata = labels.tolist(), label_img=F.interpolate(inputs2,size=(32,32)), global_step=batch_idx)
+            # self.writer.add_images()
+            # self.writer.close()
             y_pred = [np.atleast_1d(t.detach().cpu().numpy()) if isinstance(t, torch.Tensor) else np.atleast_1d(t) for t
                       in y_pred]
             y_pred = np.concatenate(y_pred)
@@ -809,6 +782,20 @@ class train_new():
         plt.savefig(f'D:/antispoof/feat_map/{self.config.weight_name}/{img_num}/{name}.jpg')
         plt.close()
 
+    def visualize_feat2TSNE(self, feats:torch.Tensor, labels, path):
+        '''
+        feats.shape = N,D
+        labels.shape = N
+        '''
+        if not path : path = f'weight/{self.config.model_name}/tsne.jpg'
+        else : path = f'weight/{self.config.model_name}/{path}'
+        tsne = TSNE(n_components=2,perplexity=30,init='pca',random_state=42)
+        tsne_results = tsne.fit_transform(feats.detach().cpu().numpy())
+        fig,ax = plt.subplots(1,1,figsize=(10,10))
+        sns.scatterplot(x=tsne_results[:, 0], y=tsne_results[:, 1], hue=labels.numpy(),ax=ax)
+        fig.tight_layout()
+        fig.savefig(path)
+        plt.close(fig)
 
 class FigureWrapper:
     def __init__(self, num_feats=5):

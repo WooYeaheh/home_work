@@ -13,18 +13,18 @@ def main(config):
     trainDataset, valDataset, testDataset = data.get_display_path(config)
     train.train(config, trainDataset, valDataset, testDataset)
 def main_new(config):
-    train.train_new(config, AFS_dataset_train_two, AFS_dataset_val, AFS_dataset_test)
-    #train.train_new(config, AFS_dataset_train, AFS_dataset_val, AFS_dataset_test)
+    # train.train_new(config, AFS_dataset_train_two, AFS_dataset_val, AFS_dataset_test)
+    train.train_new(config, AFS_dataset_train, AFS_dataset_val, AFS_dataset_test)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', default='Diff_attention', type=str, help='name of training model')
-    parser.add_argument('--weight_name', default='Diff_attention', type=str, help='weight name')
+    parser.add_argument('--model_name', default='Swin_adapter1', type=str, help='name of training model')
+    parser.add_argument('--weight_name', default='Swin_adapter1', type=str, help='weight name')
     parser.add_argument('--ckpt_folder_root', default='./weight/c_model/', type=str, help='folder name for ckpt folder')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--test_batch_size', type=int, default=260)
+    parser.add_argument('--test_batch_size', type=int, default=12)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--last_lr', default=0.00005, type=float, help='last learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, help='momentum value for momentum SGD')

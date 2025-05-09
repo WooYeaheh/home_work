@@ -10,6 +10,318 @@ from collections import defaultdict
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
+from torch import nn, Tensor
+from typing import Any, Callable, List, Optional
+from torchvision.models.swin_transformer import ShiftedWindowAttention, SwinTransformerBlock
+
+def min_max_normalize(t):
+    t_min = t.min()
+    t_max = t.max()
+    return (t - t_min) / (t_max - t_min + 1e-8)
+
+import inspect
+
+def filter_kwargs(func, kwargs):
+    sig = inspect.signature(func)
+    valid_keys = sig.parameters.keys()
+    return {k: v for k, v in kwargs.items() if k in valid_keys}
+
+class swin_ca(ShiftedWindowAttention):
+    def __init__(self,dim, window_size, # : List[int],
+        shift_size,#: List[int],
+        num_heads,#: int,
+        attention_dropout,#: float = 0.0,
+        dropout,**kwargs):
+        super().__init__(dim,
+        window_size, # : List[int],
+        shift_size,#: List[int],
+        num_heads,#: int,
+        attention_dropout,#: float = 0.0,
+        dropout,**kwargs)#: float = 0.0,)
+
+        self.q, self.k, self.v = nn.Linear(dim, dim), nn.Linear(dim, dim), nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+    def shifted_window_attention(self,
+            input_q: Tensor,
+            input_k: Tensor,
+            input_v: Tensor,
+            relative_position_bias: Tensor,
+            window_size: List[int],
+            num_heads: int,
+            shift_size: List[int],
+            attention_dropout: float = 0.0,
+            dropout: float = 0.0,
+            logit_scale: Optional[torch.Tensor] = None,
+            training: bool = True,
+    ) -> Tensor:
+
+        B, H, W, C = input_q.shape
+        # pad feature maps to multiples of window size
+        pad_r = (window_size[1] - W % window_size[1]) % window_size[1]
+        pad_b = (window_size[0] - H % window_size[0]) % window_size[0]
+        x_q = F.pad(input_q, (0, 0, 0, pad_r, 0, pad_b))
+        x_k = F.pad(input_k, (0, 0, 0, pad_r, 0, pad_b))
+        x_v = F.pad(input_v, (0, 0, 0, pad_r, 0, pad_b))
+
+        _, pad_H, pad_W, _ = x_q.shape
+
+        shift_size = shift_size.copy()
+        # If window size is larger than feature size, there is no need to shift window
+        if window_size[0] >= pad_H:
+            shift_size[0] = 0
+        if window_size[1] >= pad_W:
+            shift_size[1] = 0
+
+        # cyclic shift
+        if sum(shift_size) > 0:
+            x_q = torch.roll(x_q, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+            x_k = torch.roll(x_k, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+            x_v = torch.roll(x_v, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+
+        # partition windows
+        num_windows = (pad_H // window_size[0]) * (pad_W // window_size[1])
+        x_q = x_q.view(B, pad_H // window_size[0], window_size[0], pad_W // window_size[1], window_size[1], C)
+        x_q = x_q.permute(0, 1, 3, 2, 4, 5).reshape(B * num_windows, window_size[0] * window_size[1], C)  # B*nW, Ws*Ws, C
+        x_k = x_k.view(B, pad_H // window_size[0], window_size[0], pad_W // window_size[1], window_size[1], C)
+        x_k = x_k.permute(0, 1, 3, 2, 4, 5).reshape(B * num_windows, window_size[0] * window_size[1], C)
+        x_v = x_v.view(B, pad_H // window_size[0], window_size[0], pad_W // window_size[1], window_size[1], C)
+        x_v = x_v.permute(0, 1, 3, 2, 4, 5).reshape(B * num_windows, window_size[0] * window_size[1], C)
+
+        # multi-head attention
+        q = self.q(x_q).reshape(x_v.size(0), x_v.size(1), num_heads, C // num_heads).permute(0, 2, 1, 3)
+        k = self.k(x_k).reshape(x_v.size(0), x_v.size(1), num_heads, C // num_heads).permute(0, 2, 1, 3)
+        v = self.v(x_v).reshape(x_v.size(0), x_v.size(1), num_heads, C // num_heads).permute(0, 2, 1, 3)
+
+        if logit_scale is not None:
+            # cosine attention
+            attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+            logit_scale = torch.clamp(logit_scale, max=math.log(100.0)).exp()
+            attn = attn * logit_scale
+        else:
+            q = q * (C // num_heads) ** -0.5
+            attn = q.matmul(k.transpose(-2, -1))
+        # add relative position bias
+        attn = attn + relative_position_bias
+
+        if sum(shift_size) > 0:
+            # generate attention mask
+            attn_mask = x_q.new_zeros((pad_H, pad_W))
+            h_slices = ((0, -window_size[0]), (-window_size[0], -shift_size[0]), (-shift_size[0], None))
+            w_slices = ((0, -window_size[1]), (-window_size[1], -shift_size[1]), (-shift_size[1], None))
+            count = 0
+            for h in h_slices:
+                for w in w_slices:
+                    attn_mask[h[0]: h[1], w[0]: w[1]] = count
+                    count += 1
+            attn_mask = attn_mask.view(pad_H // window_size[0], window_size[0], pad_W // window_size[1], window_size[1])
+            attn_mask = attn_mask.permute(0, 2, 1, 3).reshape(num_windows, window_size[0] * window_size[1])
+            attn_mask = attn_mask.unsqueeze(1) - attn_mask.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+            attn = attn.view(x_q.size(0) // num_windows, num_windows, num_heads, x_q.size(1), x_q.size(1))
+            attn = attn + attn_mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, num_heads, x_q.size(1), x_q.size(1))
+
+        attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, p=attention_dropout, training=training)
+
+        x = attn.matmul(v).transpose(1, 2).reshape(x_q.size(0), x_q.size(1), C)
+        x = self.proj(x)
+        x = F.dropout(x, p=dropout, training=training)
+
+        # reverse windows
+        x = x.view(B, pad_H // window_size[0], pad_W // window_size[1], window_size[0], window_size[1], C)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, pad_H, pad_W, C)
+
+        # reverse cyclic shift
+        if sum(shift_size) > 0:
+            x = torch.roll(x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
+
+        # unpad features
+        x = x[:, :H, :W, :].contiguous()
+
+        return x
+
+    def forward(self, x_q, x_k, x_v):
+        relative_position_bias = self.get_relative_position_bias()
+
+        return self.shifted_window_attention(
+            x_q, x_k, x_v,
+            relative_position_bias,
+            self.window_size,
+            self.num_heads,
+            shift_size=self.shift_size,
+            attention_dropout=self.attention_dropout,
+            dropout=self.dropout,
+            training=self.training,
+        )
+
+class Swin_CA_block(SwinTransformerBlock):
+    def __init__(self,
+        attn_layer,
+        dim: int,
+        num_heads: int,
+        window_size: List[int],
+        shift_size: List[int],
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        stochastic_depth_prob: float = 0.0,
+        norm_layer = nn.LayerNorm,
+        **kwargs):
+        super().__init__(
+        dim,
+        num_heads,
+        window_size,
+        shift_size,
+        mlp_ratio,
+        dropout,
+        attention_dropout,
+        stochastic_depth_prob,
+        norm_layer,
+        attn_layer,
+    )
+    def forward(self, x_q, x_k, x_v):
+        x = x_q + self.stochastic_depth(self.attn(self.norm1(x_q),self.norm1(x_k),self.norm1(x_v)))
+        x = x + self.stochastic_depth(self.mlp(self.norm2(x)))
+        return x
+
+class Swin_anti(nn.Module):
+    ''' 2 2 8 2 block들 사이에만 adapter '''
+    def __init__(self):
+        super().__init__()
+        from torchvision.models.swin_transformer import swin_b, shifted_window_attention
+        self.model = swin_b(pretrained = True)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        # for p in self.model.features[-1].parameters():
+        #     p.requires_grad = True
+        self.model.head = nn.Linear(self.model.head.in_features,2)
+        depths = self.model.depths
+        self.num_layers = len(self.model.features) # 8
+
+        self.Patch_merge = nn.ModuleList()
+        for idx in range(self.num_layers//2):
+            self.Patch_merge.append(self.model.features[2*idx])
+
+        self.Swin_blocks_group = nn.ModuleList()
+        for idx in range(self.num_layers//2):
+            swin_blocks = nn.Sequential()
+            for i_layers in range(depths[idx]):
+                swin_blocks.append(self.model.features[2*idx+1][i_layers]) # Swinblock들
+            self.Swin_blocks_group.append(swin_blocks) # 1,56,56,128
+
+        self.CA_blocks_1 = nn.ModuleList()
+        for idx in range(self.num_layers//2):
+            kwargs = self.Swin_blocks_group[idx][0]._init_args
+            self.CA_blocks_1.append(swin_ca(**kwargs)) # Swin_CA_block
+        self.CA_blocks_2 = copy.deepcopy(self.CA_blocks_1)
+
+        super_dict = {k: v for k, v in self.model.named_modules() if k in ['permute', 'norm','avgpool','flatten','head']}
+        for k, v in super_dict.items():
+            if k != 'self':
+                setattr(self, k, v)
+
+    def forward(self, rgb, ir):
+        output = defaultdict(torch.tensor)
+        for idx in range(self.num_layers//2):
+            rgb = self.Patch_merge[idx](rgb)
+            ir = self.Patch_merge[idx](ir)
+
+            x_r = self.Swin_blocks_group[idx](rgb)
+            x_i = self.Swin_blocks_group[idx](ir)
+
+            rgb = x_r + self.CA_blocks_1[idx](x_r, x_i, x_i)
+            ir = x_i + self.CA_blocks_2[idx](x_i, x_r, x_r)
+        feat1 = self.forward_last(rgb)
+        feat2 = self.forward_last(ir)
+        output['feat_1'], output['rgb_feats'] = feat1
+        output['feat_2'], output['ir_feats'] = feat2
+        return output
+    def forward_last(self, x):
+        x = self.norm(x)
+        x = self.permute(x)
+        x = self.avgpool(x)
+        feats = self.flatten(x)
+        x = self.head(feats)
+        return x, feats
+
+class Swin_anti_adapter1(nn.Module):
+    '''
+    if mlp_ratio = 4.0 (default)
+        just Swin params : 87.7M
+        params : 296M
+        trainable params : 235M
+    elif mlp_ratio = 0.5 (revised version)
+        trainable params : 110M
+
+    Adapter를 swinblock -> swin ca로 변경
+        trainable params : 97M
+    '''
+    def __init__(self):
+        super().__init__()
+        from torchvision.models.swin_transformer import swin_b, shifted_window_attention
+        self.model = swin_b(pretrained = True)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        # for p in self.model.features[-1].parameters():
+        #     p.requires_grad = True
+        self.model.head = nn.Linear(self.model.head.in_features,2)
+        self.depths = self.model.depths
+        self.num_layers = len(self.model.features) # 8
+
+        self.Patch_merge = nn.ModuleList()
+        for idx in range(self.num_layers//2):
+            self.Patch_merge.append(self.model.features[2*idx])
+
+        self.Swin_blocks_group = nn.ModuleList()
+        for idx in range(self.num_layers//2):
+            swin_blocks = nn.Sequential()
+            for i_layers in range(self.depths[idx]):
+                swin_blocks.append(self.model.features[2*idx+1][i_layers]) # Swinblock들
+            self.Swin_blocks_group.append(swin_blocks) # 1,56,56,128
+
+        self.Swin_blocks_Adapters1 = nn.ModuleList()
+        for idx in range(self.num_layers // 2):
+            swin_adapters = nn.Sequential()
+            for i_layers in range(self.depths[idx]):
+                kwargs = self.model.features[2 * idx + 1][i_layers]._init_args
+                swin_adapters.append(swin_ca(**kwargs))
+            self.Swin_blocks_Adapters1.append(swin_adapters)  # 1,56,56,128
+
+        self.Swin_blocks_Adapters2 = copy.deepcopy(self.Swin_blocks_Adapters1)
+
+        super_dict = {k: v for k, v in self.model.named_modules() if k in ['permute', 'norm','avgpool','flatten','head']}
+        for k, v in super_dict.items():
+            if k != 'self':
+                setattr(self, k, v)
+
+    def forward(self, rgb, ir):
+        output = defaultdict(torch.tensor)
+        for idx in range(self.num_layers//2):
+            rgb = self.Patch_merge[idx](rgb)
+            ir = self.Patch_merge[idx](ir)
+
+            for i_layer in range(self.depths[idx]):
+
+                x_r = self.Swin_blocks_group[idx][i_layer](rgb)
+                x_i = self.Swin_blocks_group[idx][i_layer](ir)
+
+                rgb = x_r + self.Swin_blocks_Adapters1[idx][i_layer](x_r, x_i, x_i)
+                ir = x_i + self.Swin_blocks_Adapters2[idx][i_layer](x_i, x_r, x_r)
+        feat1 = self.forward_last(rgb)
+        feat2 = self.forward_last(ir)
+        output['feat_1'], output['rgb_feats'] = feat1
+        output['feat_2'], output['ir_feats'] = feat2
+        return output
+
+    def forward_last(self, x):
+        x = self.norm(x)
+        x = self.permute(x)
+        x = self.avgpool(x)
+        feats = self.flatten(x)
+        x = self.head(feats)
+        return x, feats
+
 
 class Conv2d_cd(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
@@ -349,6 +661,9 @@ class U_Adapter(nn.Module):
         return x_up
 
 class MMDG(nn.Module):
+    '''
+    trainable params : 7.5M
+    '''
     def __init__(self, dropout_ratio=0.3, exp_rate=2.25, num_sample=20, adapter_dim=8, r_ssp=0.3):
         super(MMDG, self).__init__()
         self.num_encoders = 5
@@ -603,6 +918,7 @@ class MMDG2(nn.Module):
 
             y1 = self.ViT_Encoder[i].ln_2(x1_a)
             y2 = self.ViT_Encoder[i].ln_2(x2_a)
+
             y1_m = self.adapter1[i - 1](y1)
             y2_m = self.adapter2[i - 1](y2)
             y1_k = self.ca1[i - 1](y2_m, y1_m, y1_m) + y1_m
@@ -1194,6 +1510,9 @@ class MAViT(nn.Module):
         return self.out
 
 class ViT(nn.Module):
+    '''
+    trainable params : 31M
+    '''
     def __init__(self, hidden_dim=768):
         super(ViT, self).__init__()
         self.num_encoders = 5
@@ -2476,8 +2795,12 @@ class Diff_attention(nn.Module):
             map2  = torch.bmm(patch2, cls2.unsqueeze(-1)).squeeze(-1)
             #map2 = (F.cosine_similarity(patch2, cls2.unsqueeze(1), dim=-1) + 1)/2
 
-            x1_c = torch.cat((cls1.unsqueeze(-2), patch1 * F.normalize(map1 - map2).unsqueeze(-1)), dim=1)
-            x2_c = torch.cat((cls2.unsqueeze(-2), patch2 * F.normalize(map2 - map1).unsqueeze(-1)), dim=1)
+            # x1_c = torch.cat((cls1.unsqueeze(-2), patch1 * F.normalize(map1 - map2).unsqueeze(-1)), dim=1)
+            # x2_c = torch.cat((cls2.unsqueeze(-2), patch2 * F.normalize(map2 - map1).unsqueeze(-1)), dim=1)
+
+
+            x1_c = torch.cat((cls1.unsqueeze(-2), patch1 * min_max_normalize(map1 - map2).unsqueeze(-1)), dim=1)
+            x2_c = torch.cat((cls2.unsqueeze(-2), patch2 * min_max_normalize(map2 - map1).unsqueeze(-1)), dim=1)
 
             y1 = x1_a + self.adapter_1_2_2[i - 1](x2_c, x1_b, x1_b)  #ln 이전 더하기
             y2 = x2_a + self.adapter_2_1_2[i - 1](x1_c, x2_b, x2_b)
@@ -2723,4 +3046,6 @@ class CLIP_star(nn.Module):
         return F.cross_entropy(logits, label)
 
 if __name__ == '__main__':
+    model = Swin_anti()
+    input = torch.rand(size=(2,3,224,224))
     pass

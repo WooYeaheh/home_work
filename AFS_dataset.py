@@ -54,8 +54,10 @@ def apply_same_transform(img_a, img_b, img_c):
     seed = 42
     transform = Compose([
         remove,
-        transforms.ToTensor(),
         transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.ToTensor(),
     ])
 
     torch.manual_seed(seed)

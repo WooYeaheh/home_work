@@ -17,6 +17,9 @@ def model_loader(model_name):
     elif model_name == 'ViT_text2': net = ViT_text2()
     elif model_name == 'ViT_text3': net = ViT_text3()
     elif model_name == 'CLIP_star': net = CLIP_star()
+    elif model_name == 'Swin': net = Swin_anti()
+    elif model_name == 'Swin_adapter1': net = Swin_anti_adapter1()
+
     else:
         raise NameError('UNKNOWN MODEL NAME')
     return net
